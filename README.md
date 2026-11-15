@@ -6,6 +6,14 @@ Tek satirla LuaTools + 64-bit Steam kurulumu — herkes icin:
 curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/arkadas-luatools/v2.0.0/kur-remote.sh | bash
 ```
 
+## Eski surumler (v1.0.0, v1.0.1)
+
+Kaldirildi. Bu tag'lere pinli eski komutlar artik 404 verir — kasitli:
+yanlis hash'le yarim kurulum yapmalari engellendi. Tek desteklenen komut
+yukaridaki (v2.0.0). Bir makinede eski komut "BAŞARISIZ / checksum did NOT
+match" verdiyse sebep GitHub raw CDN'inin bayat bootstrap sunmasiydi;
+kurulum hic baslamadi, makineye bir sey olmadi. Yeni komutla tekrarla.
+
 ## Gereksinimler
 
 - Linux x86_64, **native Steam** (Flatpak/Snap desteklenmez)
