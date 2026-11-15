@@ -1,0 +1,585 @@
+#!/bin/sh
+# slsteam-moon wrapper. Injects SLSsteam via LD_AUDIT (rtld-audit) so the audit
+# namespace can't interpose on Steam's own copies of protobuf / yaml-cpp /
+# libstdc++. library-inject.so redirects libcurl to the system copy and must
+# come first. CloudRedirect (cloud saves) is injected separately via LD_PRELOAD
+# (see its block below).
+SLSDIR="$HOME/.local/share/SLSsteam"
+
+# Desktop entries from older installs may invoke this wrapper with our audit
+# DSOs already present in LD_AUDIT.  Remove only our known objects immediately,
+# before helper commands (readlink, stat, awk, …) are spawned.  An inherited
+# third-party auditor is preserved and is reattached after the guard has made
+# its decision.
+slsm_strip_own_auditors() {
+	_slsm_old_ifs="$IFS"
+	IFS=:
+	_slsm_clean=""
+	for _slsm_audit in ${LD_AUDIT:-}; do
+		case "$_slsm_audit" in
+			''|*SLSsteam.so|*library-inject.so|*libSLSsteam.so|*libSLS-library-inject.so)
+				continue ;;
+			*)
+				_slsm_clean="${_slsm_clean:+$_slsm_clean:}$_slsm_audit" ;;
+		esac
+	done
+	IFS="$_slsm_old_ifs"
+	printf '%s' "$_slsm_clean"
+}
+SLSM_INHERITED_AUDIT="$(slsm_strip_own_auditors)"
+if [ -n "$SLSM_INHERITED_AUDIT" ]; then
+	export LD_AUDIT="$SLSM_INHERITED_AUDIT"
+else
+	unset LD_AUDIT
+fi
+
+# Resolve the real Steam binary, skipping our own wrapper.
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+STEAM_BIN=""
+SLSM_EXPLICIT_STEAM_BIN=0
+# A retained mirrored backup can itself be a managed shim after an interrupted
+# restore. Never let an explicit hook promote that shim back into the launch
+# chain; resolve a vanilla Steam path instead.
+if [ -n "${SLSM_STEAM_BIN:-}" ] && \
+   head -3 "$SLSM_STEAM_BIN" 2>/dev/null | \
+   grep -qF "slsteam-moon system launcher shim"; then
+	unset SLSM_STEAM_BIN
+fi
+# Override hook: an explicit, executable path wins. Lets power users pin a
+# specific Steam binary and lets the wrapper guard's unit test inject a fake
+# Steam; a no-op when unset.
+if [ -n "${SLSM_STEAM_BIN:-}" ] && [ -x "${SLSM_STEAM_BIN:-}" ] && \
+   [ "$(readlink -f "$SLSM_STEAM_BIN" 2>/dev/null || echo "$SLSM_STEAM_BIN")" != "$SELF" ]; then
+	STEAM_BIN="$SLSM_STEAM_BIN"
+	SLSM_EXPLICIT_STEAM_BIN=1
+fi
+if [ -z "$STEAM_BIN" ]; then
+	for c in /usr/games/steam /usr/bin/steam /usr/local/bin/steam; do
+		if [ -x "$c" ] \
+			&& [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ] \
+			&& ! head -3 "$c" 2>/dev/null | grep -q "slsteam-moon system launcher shim"; then
+			STEAM_BIN="$c"
+			break
+		fi
+	done
+fi
+if [ -z "$STEAM_BIN" ]; then
+	# Fall back to PATH lookup, but skip ourselves.
+	IFS=:
+	for d in $PATH; do
+		c="$d/steam"
+		if [ -x "$c" ] \
+			&& [ "$(readlink -f "$c" 2>/dev/null || echo "$c")" != "$SELF" ] \
+			&& ! head -3 "$c" 2>/dev/null | grep -q "slsteam-moon system launcher shim"; then
+			STEAM_BIN="$c"
+			break
+		fi
+	done
+	unset IFS
+fi
+# All system launchers are our shims or absent.  Fall back to the
+# steam.sh script inside the Steam data directory (it is what the
+# system launcher would exec anyway once the bootstrap is set up).
+if [ -z "$STEAM_BIN" ]; then
+	for c in "${HOME}/.local/share/Steam/steam.sh" \
+	         "${HOME}/.steam/steam/steam.sh" \
+	         "${HOME}/.steam/debian-installation/steam.sh"; do
+		if [ -x "$c" ]; then
+			STEAM_BIN="$c"
+			break
+		fi
+	done
+fi
+if [ -z "$STEAM_BIN" ]; then
+	echo "slsteam-moon: could not find the real Steam binary" >&2
+	exit 127
+fi
+# Canonicalize relative paths before we touch cwd below. Absolute paths must
+# remain verbatim because the bootstrap guard below matches their managed
+# launcher prefixes literally.
+case "$STEAM_BIN" in
+	/*) ;;
+	*) STEAM_BIN="$(readlink -f "$STEAM_BIN" 2>/dev/null || echo "$STEAM_BIN")" ;;
+esac
+
+# Valve's distro launcher (bin_steam.sh, which /usr/bin/steam symlinks to on
+# Fedora/Nobara) takes its whole identity from its own argv[0]:
+#
+#     STEAMPACKAGE="${0##*/}" ... *) log "Unknown Steam package"; exit 1
+#
+# A captured original such as system-launcher-backup/usr/bin/steam.orig is
+# exactly that case, so exec'ing it aborts the launch before Steam opens its
+# logger: Steam silently never starts and no log is written anywhere. Never
+# exec a launcher under a name it can reject - route through a `steam`-named
+# alias for the same file. This also heals a shim written by an older release
+# that still hands over the `.orig` path directly.
+# SLSM_POLICY_BIN keeps the resolved path so the bootstrap guard below still
+# classifies the launcher by what was actually resolved, not by the alias.
+SLSM_POLICY_BIN="$STEAM_BIN"
+slsm_launcher_name_safe() {
+	case "${1##*/}" in
+		steam|steambeta|bin_steam.sh|steam.sh) return 0 ;;
+	esac
+	return 1
+}
+slsm_same_file() {
+	_slsm_a="$(readlink -f "$1" 2>/dev/null || true)"
+	_slsm_b="$(readlink -f "$2" 2>/dev/null || true)"
+	[ -n "$_slsm_a" ] && [ "$_slsm_a" = "$_slsm_b" ]
+}
+slsm_normalize_launcher() {
+	slsm_launcher_name_safe "$STEAM_BIN" && return 0
+	# 1) The alias the installer keeps next to the captured original.
+	_slsm_sibling="${STEAM_BIN%/*}/steam"
+	if [ -x "$_slsm_sibling" ] && slsm_same_file "$_slsm_sibling" "$STEAM_BIN"; then
+		STEAM_BIN="$_slsm_sibling"
+		return 0
+	fi
+	# 2) A private alias we own, created on demand.
+	_slsm_alias_dir="$SLSDIR/launcher-alias"
+	_slsm_alias="$_slsm_alias_dir/steam"
+	if mkdir -p "$_slsm_alias_dir" 2>/dev/null; then
+		if ! slsm_same_file "$_slsm_alias" "$STEAM_BIN"; then
+			[ -L "$_slsm_alias" ] || rm -f "$_slsm_alias" 2>/dev/null || true
+			ln -sfn "$STEAM_BIN" "$_slsm_alias" 2>/dev/null || true
+		fi
+		if [ -x "$_slsm_alias" ] && slsm_same_file "$_slsm_alias" "$STEAM_BIN"; then
+			STEAM_BIN="$_slsm_alias"
+			return 0
+		fi
+	fi
+	# 3) Nothing aliasable: the data-dir steam.sh ignores its own name.
+	for _slsm_c in "${HOME}/.local/share/Steam/steam.sh" \
+	               "${HOME}/.steam/steam/steam.sh" \
+	               "${HOME}/.steam/debian-installation/steam.sh"; do
+		if [ -x "$_slsm_c" ]; then
+			STEAM_BIN="$_slsm_c"
+			return 0
+		fi
+	done
+	return 1
+}
+slsm_normalize_launcher || true
+
+# Some Steam launchers (Nix's FHS/bwrap wrapper) replicate our cwd inside
+# their sandbox via --chdir. If we were started from a short-lived temp dir
+# (an installer extracting to $(mktemp -d) before running us), the sandbox's
+# isolated /tmp won't have it and bwrap fails to chdir. $HOME is always
+# there, so pin cwd to it now that STEAM_BIN is resolved.
+cd "$HOME" 2>/dev/null || cd / 2>/dev/null || true
+
+slsm_exec_vanilla() {
+	# Safe mode must not depend on what a desktop entry or parent shell put in
+	# the loader environment.  Unset the complete loader surface, not only our
+	# own names, so a broken third-party preload cannot keep the recovery loop.
+	exec env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH "$STEAM_BIN" "$@"
+}
+
+# Debian's Install Steam package stub is a valid executable before the client
+# root exists, but it is not a Steam client and must never receive injection.
+# Explicit test/pinned binaries remain eligible; captured originals from our
+# system-launcher backup are shim-originated and still require bootstrap.
+slsm_bootstrap_guard() {
+	if [ "${SLSM_EXPLICIT_STEAM_BIN:-0}" = 1 ]; then
+		case "$SLSM_POLICY_BIN" in
+			"$SLSDIR/system-launcher-backup/"*) ;;
+			*) return 0 ;;
+		esac
+	else
+		case "$SLSM_POLICY_BIN" in
+			/usr/games/steam|/usr/bin/steam|/usr/local/bin/steam) ;;
+			*) return 0 ;;
+		esac
+	fi
+	[ -L "$HOME/.steam/steam" ] || return 1
+	_slsm_bootstrap_root="$(readlink -e "$HOME/.steam/steam" 2>/dev/null || true)"
+	[ -n "$_slsm_bootstrap_root" ] || return 1
+	[ -f "$_slsm_bootstrap_root/steam.sh" ] && \
+		[ -x "$_slsm_bootstrap_root/steam.sh" ]
+}
+if ! slsm_bootstrap_guard; then
+	slsm_exec_vanilla "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# Crash-loop fail-safe (Game Mode boot protection).
+#
+# In a gamescope "Game Mode" session the supervisor relaunches Steam every time
+# it exits. If our injected stack (SLSsteam via LD_AUDIT / CloudRedirect via
+# LD_PRELOAD / the Lumen sidecar) goes incompatible with a freshly-updated Steam
+# client and stalls the engine, the device loops on the splash forever and the
+# user can never reach Desktop Mode to update. This guard counts boots that
+# CRASHED AT STARTUP (Steam wrote an assert/crash minidump within the boot's
+# first few minutes) and, past a threshold, LATCHES into a safe mode that starts
+# Steam completely vanilla (no LD_AUDIT, no LD_PRELOAD, no sidecar) so the
+# session comes up. The latch is scoped to THAT SESSION: a relaunch loop lives
+# entirely inside one boot, so a boot is all the time pausing injection needs to
+# cover, and every new session re-arms it. (A latch that outlived the boot left
+# the user on a silently unhooked Steam - no plugin UI, no explanation - that
+# only a payload reinstall could undo.) We deliberately key off the crash dump
+# and NOT merely a short-lived session: switching Game Mode <-> Desktop, a client
+# self-update restart, or a quick manual quit all end Steam fast but are NOT
+# failures, and a clean kill never writes a dump. As a fast path, a startup crash whose
+# steamclient.so differs from the last cleanly-booted one latches on the FIRST
+# crash (a fresh client is the near-certain cause), so the user is not made to
+# loop MAX_FAILS times for a known-cause break; a crash on an UNCHANGED client
+# keeps the conservative MAX_FAILS threshold. Session/distro-agnostic: ChimeraOS/Bazzite
+# (sessions.d STEAMCMD), SteamOS (steam-launcher PATH drop-in) and Desktop Mode
+# all funnel through this one wrapper. Every step is best-effort and can never
+# itself block the launch.
+GUARD_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/slsteam-moon"
+mkdir -p "$GUARD_DIR" 2>/dev/null || true
+GUARD_LAST="$GUARD_DIR/last_launch"          # mtime = start of the most recent boot
+GUARD_GFX="$GUARD_DIR/last_launch_display"   # 1/0: did the most recent launch have a display
+GUARD_COUNT="$GUARD_DIR/boot_fail_count"
+GUARD_SAFE="$GUARD_DIR/safe_mode"            # present => stay vanilla
+GUARD_FP="$GUARD_DIR/safe_mode_fingerprint"  # payload id captured when latched
+GUARD_SESSION="$GUARD_DIR/session_id"        # session the latch and fail count belong to
+GUARD_CLIENT_LAST="$GUARD_DIR/last_client"   # steamclient.so id the most recent boot ran
+GUARD_CLIENT_GOOD="$GUARD_DIR/good_client"   # steamclient.so id of the last boot that started cleanly
+GUARD_LOG="$GUARD_DIR/guard.log"
+
+# Tunables (overridable for testing).
+[ -n "${SLSM_GUARD_MAX_FAILS:-}" ] || SLSM_GUARD_MAX_FAILS=3
+[ -n "${SLSM_GUARD_STARTUP_SECS:-}" ] || SLSM_GUARD_STARTUP_SECS=180
+[ -n "${SLSM_GUARD_DUMPS_DIR:-}" ] || SLSM_GUARD_DUMPS_DIR="/tmp/dumps"
+
+guard_log() {
+	printf '%s %s\n' "$(date '+%F %T' 2>/dev/null)" "$1" >> "$GUARD_LOG" 2>/dev/null || true
+}
+# Non-blocking, auto-dismissing notice (10s, normal urgency). NOT critical:
+# the freedesktop spec lets the shell pin critical notifications on screen with
+# no timeout (KDE does), which is why an earlier critical recovery notice never
+# went away. Best-effort; never blocks the launch.
+guard_notify() {
+	if command -v notify-send >/dev/null 2>&1; then
+		notify-send -u normal -t 10000 "Steam recovery mode" "$1" >/dev/null 2>&1 || true
+	fi
+}
+guard_read_int() {
+	_v="$(cat "$1" 2>/dev/null)"
+	case "$_v" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_v" ;; esac
+}
+# Identify the machine's current session. The kernel's boot_id changes on every
+# boot; btime (boot epoch) is the fallback. Empty when neither is readable, in
+# which case the state simply never looks stale and the guard keeps its old
+# persistent behaviour instead of re-arming on every launch.
+guard_session_id() {
+	_sid="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+	[ -n "$_sid" ] || _sid="$(sed -n 's/^btime //p' /proc/stat 2>/dev/null || true)"
+	printf '%s' "$_sid"
+}
+# A launch with no display tells us nothing about the injected stack: Steam
+# cannot open a display, dies inside libX11 (XQueryExtension) and writes an
+# ordinary crash_*.dmp on its way out - vanilla Steam included. Scripted or
+# remote launches must not be able to latch recovery mode for a graphical
+# session that was never started.
+guard_has_display() {
+	[ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
+}
+# Identify the Steam client library (size:mtime of the 32-bit steamclient.so we
+# hook). A client self-update rewrites it, changing this id - the signal that a
+# startup crash is a compatibility break rather than a one-off. Empty when no
+# client is found yet (fresh install): callers then stay conservative.
+guard_client_fp() {
+	for _r in "$HOME/.steam/steam" "$HOME/.steam/debian-installation" "$HOME/.local/share/Steam"; do
+		_c="$_r/ubuntu12_32/steamclient.so"
+		if [ -e "$_c" ]; then
+			stat -c '%s:%Y' "$_c" 2>/dev/null || stat -f '%z:%m' "$_c" 2>/dev/null || printf '?'
+			return 0
+		fi
+	done
+	printf ''
+}
+# Fingerprint the injected payload (size:mtime of each piece). Updating ANY of
+# it - which the plugin does on reinstall/update - changes this, so a stuck
+# safe-mode latch auto-clears once the user has updated.
+guard_fingerprint() {
+	for _f in "$SLSDIR/SLSsteam.so" \
+	          "$HOME/.local/share/CloudRedirect/cloud_redirect.so" \
+	          "$HOME/.local/share/Lumen/lumen"; do
+		if [ -e "$_f" ]; then
+			stat -c '%s:%Y' "$_f" 2>/dev/null || stat -f '%z:%m' "$_f" 2>/dev/null || printf '?'
+		else
+			printf -- '-'
+		fi
+		printf '|'
+	done
+}
+GUARD_CUR_FP="$(guard_fingerprint)"
+[ -n "${SLSM_GUARD_SESSION_ID:-}" ] || SLSM_GUARD_SESSION_ID="$(guard_session_id)"
+
+# True when Steam wrote a FATAL crash minidump during the boot that started at
+# epoch $2 (marker file $1), within that boot's first STARTUP_SECS. This is the
+# definitive "Steam crashed before it became usable" signal. A clean kill (Game
+# Mode <-> Desktop switch, shutdown) or a quick manual quit does NOT write a
+# dump, so those never count as failures - which is why we use this instead of a
+# bare "the session was short" heuristic.
+#
+# Match ONLY crash_*.dmp (fatal: segfault/abort that takes the client down).
+# Steam also writes assert_*.dmp for NON-FATAL assertions (e.g. CloudRedirect's
+# cloud-save path-resolution asserts in remotestoragefilesynccontext.cpp) while
+# it keeps running perfectly fine, and those land in the same /tmp/dumps within
+# the startup window. A bare '*.dmp' glob counted those as startup crashes and,
+# coinciding with a Steam client self-update (client-changed -> latch on first
+# crash), wrongly paused the hook on a healthy desktop boot.
+guard_startup_crash() {
+	[ -d "$SLSM_GUARD_DUMPS_DIR" ] || return 1
+	case "$2" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$2" -gt 0 ] || return 1
+	_ref="$GUARD_DIR/.crash_win_ref"
+	touch -d "@$(( $2 + SLSM_GUARD_STARTUP_SECS ))" "$_ref" 2>/dev/null || { rm -f "$_ref" 2>/dev/null; return 1; }
+	_hit="$(find "$SLSM_GUARD_DUMPS_DIR" -maxdepth 1 -name 'crash_*.dmp' -newer "$1" ! -newer "$_ref" 2>/dev/null | head -n1)"
+	rm -f "$_ref" 2>/dev/null
+	[ -n "$_hit" ]
+}
+
+# New session? Drop the recovery state and give injection a fresh try. The fail
+# count goes with it: crash dumps live in /tmp, so a previous boot's outcome is
+# not assessable here anyway, and counting across boots let unrelated launches
+# accumulate towards a latch the user never saw happen.
+GUARD_PREV_SESSION="$(cat "$GUARD_SESSION" 2>/dev/null || true)"
+if [ "$SLSM_GUARD_SESSION_ID" != "$GUARD_PREV_SESSION" ]; then
+	if [ -f "$GUARD_SAFE" ]; then
+		guard_log "new session -> clearing the recovery latch and retrying injection"
+	fi
+	rm -f "$GUARD_SAFE" "$GUARD_FP" "$GUARD_COUNT" "$GUARD_LAST" "$GUARD_GFX" 2>/dev/null || true
+	printf '%s' "$SLSM_GUARD_SESSION_ID" > "$GUARD_SESSION" 2>/dev/null || true
+fi
+
+# Already latched in this session? Stay vanilla until the payload changes (user
+# updated) or the session ends.
+if [ -f "$GUARD_SAFE" ]; then
+	if [ "$(cat "$GUARD_FP" 2>/dev/null)" = "$GUARD_CUR_FP" ]; then
+		guard_log "safe mode active -> launching Steam without injection"
+		slsm_exec_vanilla "$@"
+	fi
+	guard_log "payload changed since latch -> clearing safe mode, retrying injection"
+	rm -f "$GUARD_SAFE" "$GUARD_FP" "$GUARD_COUNT" "$GUARD_LAST" 2>/dev/null || true
+fi
+
+# Assess the PREVIOUS boot: it failed only if Steam crashed at startup (wrote a
+# minidump in its first STARTUP_SECS). A short but clean session is NOT a
+# failure. (find/touch/stat failing degrade to "ok", so the guard never latches
+# by accident.)
+GUARD_FAILS="$(guard_read_int "$GUARD_COUNT")"
+GUARD_CLIENT_CUR="$(guard_client_fp)"
+guard_client_changed=0
+guard_assessable=0
+if [ -f "$GUARD_LAST" ]; then
+	if [ "$(cat "$GUARD_GFX" 2>/dev/null)" = 0 ]; then
+		guard_log "previous launch had no display -> its outcome is not assessed"
+	else
+		guard_assessable=1
+	fi
+fi
+if [ "$guard_assessable" = 1 ]; then
+	_then="$(stat -c %Y "$GUARD_LAST" 2>/dev/null || stat -f %m "$GUARD_LAST" 2>/dev/null || echo 0)"
+	if guard_startup_crash "$GUARD_LAST" "$_then"; then
+		GUARD_FAILS=$(( GUARD_FAILS + 1 ))
+		# If the client that just crashed differs from the last client we saw
+		# boot cleanly, a fresh client update is almost certainly the cause -
+		# recover on the FIRST crash instead of making the user sit through
+		# MAX_FAILS loops. A one-off crash on an UNCHANGED client keeps the
+		# conservative threshold (it is far more likely transient/unrelated).
+		_prev_client="$(cat "$GUARD_CLIENT_LAST" 2>/dev/null || true)"
+		_good_client="$(cat "$GUARD_CLIENT_GOOD" 2>/dev/null || true)"
+		if [ -n "$_good_client" ] && [ "$_prev_client" != "$_good_client" ]; then
+			guard_client_changed=1
+			guard_log "steamclient.so changed since last clean boot -> first startup crash treated as a compatibility break"
+		fi
+		guard_log "previous boot crashed at startup -> fail ${GUARD_FAILS}/${SLSM_GUARD_MAX_FAILS}"
+	else
+		[ "$GUARD_FAILS" -ne 0 ] && guard_log "previous boot ok (no startup crash) -> reset fail count"
+		GUARD_FAILS=0
+		# Remember the client that just booted cleanly as the known-good baseline.
+		_prev_client="$(cat "$GUARD_CLIENT_LAST" 2>/dev/null || true)"
+		[ -n "$_prev_client" ] && printf '%s' "$_prev_client" > "$GUARD_CLIENT_GOOD" 2>/dev/null || true
+	fi
+fi
+printf '%s' "$GUARD_FAILS" > "$GUARD_COUNT" 2>/dev/null || true
+
+if [ "$GUARD_FAILS" -ge "$SLSM_GUARD_MAX_FAILS" ] || { [ "$guard_client_changed" = 1 ] && [ "$GUARD_FAILS" -ge 1 ]; }; then
+	guard_log "fail count ${GUARD_FAILS} (client_changed=${guard_client_changed}) -> latching safe mode, launching vanilla Steam"
+	printf '%s' "$GUARD_CUR_FP" > "$GUARD_FP" 2>/dev/null || true
+	: > "$GUARD_SAFE" 2>/dev/null || true
+	# Drop the half-injected appinfo.vdf so vanilla Steam rebuilds a clean one;
+	# the abandoned splice (written at preinit before the hook abort) is what
+	# stalls the engine. Steam regenerates appinfo.vdf on next launch.
+	for _r in "$HOME/.steam/steam" "$HOME/.steam/debian-installation" "$HOME/.local/share/Steam"; do
+		if [ -f "$_r/appcache/appinfo.vdf" ]; then
+			rm -f "$_r/appcache/appinfo.vdf" 2>/dev/null && guard_log "removed $_r/appcache/appinfo.vdf"
+		fi
+	done
+	guard_notify "slsteam-moon paused itself for this session because Steam kept failing to start. Steam is running normally - injection is retried the next time you reboot, or right away if you update the plugin from the LuaTools menu."
+	guard_log "recovery mode latched for this session; Steam will launch unhooked until the next session or a payload update"
+	slsm_exec_vanilla "$@"
+fi
+
+# Mark the start of THIS boot for the next invocation's health check, record
+# whether it can produce a meaningful verdict (a launch with no display cannot),
+# and record the client this boot is about to run so the next assessment can tell
+# whether the client changed across a crash.
+: > "$GUARD_LAST" 2>/dev/null || true
+if guard_has_display; then
+	printf 1 > "$GUARD_GFX" 2>/dev/null || true
+else
+	printf 0 > "$GUARD_GFX" 2>/dev/null || true
+fi
+printf '%s' "$GUARD_CLIENT_CUR" > "$GUARD_CLIENT_LAST" 2>/dev/null || true
+
+# Signed pattern metadata preflight. The normal path is cache-only and performs
+# no network I/O: when both exact-module catalogs are already valid, Steam
+# launches immediately and a serialized remote revalidation runs in the
+# background. A new client build has no exact cache, so only that path waits for
+# the helper's bounded mirror deadline before continuing with the embedded
+# patterns if the network is unavailable.
+slsm_pattern_steam_root() {
+	for _slsm_root in "$HOME/.steam/steam" \
+	                  "$HOME/.steam/debian-installation" \
+	                  "$HOME/.local/share/Steam"; do
+		if [ -f "$_slsm_root/ubuntu12_32/steamclient.so" ] && \
+		   [ -f "$_slsm_root/ubuntu12_32/steamui.so" ]; then
+			printf '%s' "$_slsm_root"
+			return 0
+		fi
+	done
+	return 1
+}
+slsm_refresh_patterns() {
+	_slsm_helper="$SLSDIR/pattern-refresh"
+	[ -x "$_slsm_helper" ] || return 0
+	_slsm_root="$(slsm_pattern_steam_root)" || return 0
+	_slsm_config_root="${XDG_CONFIG_HOME:-$HOME/.config}"
+	case "$_slsm_config_root" in
+		/*) ;;
+		*) _slsm_config_root="$HOME/.config" ;;
+	esac
+	if env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+	       "$_slsm_helper" --cache-only \
+	       --steam-root "$_slsm_root" --config-root "$_slsm_config_root" \
+	       >/dev/null 2>&1 < /dev/null; then
+		(
+			trap '' HUP
+			env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+			    "$_slsm_helper" \
+			    --steam-root "$_slsm_root" --config-root "$_slsm_config_root"
+		) >/dev/null 2>&1 < /dev/null &
+	else
+		env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+		    "$_slsm_helper" \
+		    --steam-root "$_slsm_root" --config-root "$_slsm_config_root" \
+		    >/dev/null 2>&1 < /dev/null || true
+	fi
+}
+slsm_refresh_patterns
+
+# CloudRedirect (optional): inject its 32-bit cloud-save hook via LD_PRELOAD.
+# Our bundled build is CloudRedirect 2.1.5 (correct save restore via
+# StripCasShaLeaf) with the steamclient.so wait extended 10s -> 120s so it
+# attaches on slow-bootstrap distros (Arch/CachyOS) too. It is a plain
+# LD_PRELOAD library: loading it as an LD_AUDIT auditor corrupts the client
+# heap (realloc(): invalid pointer) during init, so it must NOT go in the
+# LD_AUDIT list. SLSsteam stays on LD_AUDIT (library-inject.so first).
+# CloudRedirect's constructor self-removes itself from LD_PRELOAD so child
+# processes (the game, steamwebhelper) don't inherit it.
+CR_SO="$HOME/.local/share/CloudRedirect/cloud_redirect.so"
+if [ -f "$CR_SO" ]; then
+	export LD_PRELOAD="$CR_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
+# extest (Steam Input on Wayland): SteamOS and Bazzite ship libextest, an X11
+# XTEST shim that lets the Steam Controller / Steam Input drive the desktop
+# cursor under Wayland (X11 has native XTEST, so it's only needed on Wayland).
+# Their own desktop launchers (bazzite-steam / steam-jupiter) LD_PRELOAD it on
+# Wayland. We launch the Steam binary directly — on purpose, so our LD_AUDIT and
+# CloudRedirect survive (those launchers do `env LD_PRELOAD=...`, which REPLACES
+# the list and would drop cloud_redirect.so) — so we replicate just this one
+# preload, generically: only on Wayland and only when the lib actually exists
+# (a no-op on distros that don't ship it).
+if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
+	for _ext in /usr/lib/extest/libextest.so \
+	            /usr/lib64/extest/libextest.so \
+	            /usr/lib/x86_64-linux-gnu/extest/libextest.so; do
+		if [ -f "$_ext" ]; then
+			export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$_ext"
+			break
+		fi
+	done
+fi
+
+# Lumen (millennium-less LuaTools bridge): ensure Steam's CEF remote-debugging
+# endpoint is enabled, then launch the Lumen sidecar DETACHED and WITHOUT the
+# loader env (it must use its own static libs, not Steam's 32-bit runtime).
+# Lumen injects the LuaTools frontend via CDP and hosts the backend in-process.
+# Single-instance guarded so a second wrapper invocation doesn't stack sidecars.
+LUMEN_DIR="$HOME/.local/share/Lumen"
+if [ -x "$LUMEN_DIR/lumen" ] && ! pgrep -f "$LUMEN_DIR/lumen" >/dev/null 2>&1; then
+	touch "$HOME/.steam/steam/.cef-enable-remote-debugging" 2>/dev/null || true
+	touch "$HOME/.steam/debian-installation/.cef-enable-remote-debugging" 2>/dev/null || true
+	env -u LD_AUDIT -u LD_PRELOAD -u LD_LIBRARY_PATH \
+	    LUMEN_BACKEND_DIR="$LUMEN_DIR/luatools/backend" \
+	    LUMEN_LUA_DIR="$LUMEN_DIR/lua" \
+	    setsid "$LUMEN_DIR/lumen" >/dev/null 2>&1 < /dev/null &
+fi
+
+AUDIT="$SLSDIR/library-inject.so:$SLSDIR/SLSsteam.so"
+
+# Re-assert desktop-entry coverage without putting reconciliation on the launch
+# critical path. Prefer the serialized guardian; retain the legacy CLI fallback
+# during upgrades or on desktops without a working user manager.
+if command -v systemctl >/dev/null 2>&1 && \
+   systemctl --user --quiet is-enabled slsteam-desktop-guardian.path >/dev/null 2>&1; then
+	systemctl --user start slsteam-desktop-guardian.service >/dev/null 2>&1 &
+elif [ -x "$SLSDIR/ensure-desktop-coverage.sh" ]; then
+	# Lowest priority we can give it: this fallback runs concurrently with Steam's
+	# own start, and a pass that does have work to do is seconds of shell CPU.
+	if command -v nice >/dev/null 2>&1; then
+		WRAPPER="$SLSDIR/path/steam" nice -n 10 "$SLSDIR/ensure-desktop-coverage.sh" --user >/dev/null 2>&1 &
+	else
+		WRAPPER="$SLSDIR/path/steam" "$SLSDIR/ensure-desktop-coverage.sh" --user >/dev/null 2>&1 &
+	fi
+fi
+
+# SLSsteam.so, library-inject.so, and cloud_redirect.so are 32-bit (ELFCLASS32)
+# hooks for ubuntu12_32/steam. Opt out of Valve's 64-bit steamrt64 client both
+# in steam.sh (.steam-disable-steamrt64-client / STEAM_FORCE_CLIENT) and in the
+# client self-updater (-forcemanifestsuffix ubuntu12, bypassing glibc>=2.31 ->
+# steamrt64 promotion) unless the caller explicitly overrides STEAM_FORCE_CLIENT.
+: "${STEAM_FORCE_CLIENT:=ubuntu12_32}"
+export STEAM_FORCE_CLIENT
+if [ "$STEAM_FORCE_CLIENT" = "ubuntu12_32" ] || \
+   [ "$STEAM_FORCE_CLIENT" = "scout" ] || \
+   [ "$STEAM_FORCE_CLIENT" = "ldlp" ]; then
+	for _slsm_r in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.steam/debian-installation"; do
+		[ -d "$_slsm_r" ] && : > "$_slsm_r/.steam-disable-steamrt64-client" 2>/dev/null || true
+	done
+	case "${1:-}" in
+		--reset|--run|--help|-h|--version) ;;
+		*)
+			_slsm_running_pid="$(cat "$HOME/.steam/steam.pid" 2>/dev/null || true)"
+			if [ -z "$_slsm_running_pid" ] || ! kill -0 "$_slsm_running_pid" 2>/dev/null; then
+				_slsm_has_suffix=0
+				for _slsm_arg in "$@"; do
+					if [ "$_slsm_arg" = "-forcemanifestsuffix" ]; then
+						_slsm_has_suffix=1
+						break
+					fi
+				done
+				if [ "$_slsm_has_suffix" = 0 ]; then
+					set -- "$@" -forcemanifestsuffix ubuntu12
+				fi
+			fi
+			;;
+	esac
+fi
+if [ -d "$SLSDIR/lib32" ]; then
+	export LD_LIBRARY_PATH="$SLSDIR/lib32${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+if [ -n "$SLSM_INHERITED_AUDIT" ]; then
+	export LD_AUDIT="$AUDIT:$SLSM_INHERITED_AUDIT"
+else
+	export LD_AUDIT="$AUDIT"
+fi
+exec "$STEAM_BIN" "$@"
