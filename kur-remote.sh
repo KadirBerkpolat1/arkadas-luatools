@@ -6,7 +6,7 @@
 # EXPECTED_SHA256 tar ile birlikte guncellenir; release'deki .sha256 asset'i
 # ayrica manuel dogrulama icin durur.
 set -euo pipefail
-BASE="https://github.com/KadirBerkpolat1/arkadas-luatools/releases/latest/download"
+BASE="https://github.com/KadirBerkpolat1/arkadas-luatools/releases/download/v1.0.1"
 EXPECTED_SHA256="a2bea782412b19675e1f887ec863b111fa812844127b287514bfb72077b44ab3"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
