@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # arkadas-luatools — tek satirlik kurulum:
-#   curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/arkadas-luatools/main/kur-remote.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/arkadas-luatools/v1.0.0/kur-remote.sh | bash
 # Paket release'den iner ve bu script'e pinli sha256 ile dogrulanir
 # (CDN'in iki asset'i farkli tazelikte sunma yarisi olmaz). Her release'de
 # EXPECTED_SHA256 tar ile birlikte guncellenir; release'deki .sha256 asset'i

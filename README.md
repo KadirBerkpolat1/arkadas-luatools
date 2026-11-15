@@ -3,7 +3,7 @@
 Tek satirla LuaTools (32-bit Steam) kurulumu:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/arkadas-luatools/main/kur-remote.sh | bash
+curl -fsSL https://raw.githubusercontent.com/KadirBerkpolat1/arkadas-luatools/v1.0.0/kur-remote.sh | bash
 ```
 
 ## Ne kuruluyor
