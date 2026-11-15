@@ -27,17 +27,35 @@ if [ -x "$HOME/.local/share/moon64/moon64" ]; then
 	echo "moon64 algilandi: SLSsteam wrapper'i, environment.d ve 32-bit pin'ler moon64'te; yalniz lua agaci guncelleniyor"
 fi
 
+# 7z / innoextract / aria2 yalniz fix INDIRME aninda kullanilir; kurulumun
+# kendisi bunlarsiz da tamamlanir. SteamOS/immutable'da pacman var ama kok
+# salt-okunur, sudo parolasiz olabilir: kurulumu asla burada kesme, uyar ve
+# devam et — eksik arac gerektiren fix akisi kendi hatasini verir.
 if [ "${SKIP_DEPS:-0}" != 1 ]; then
-	if command -v pacman >/dev/null; then
-		sudo pacman -S --needed --noconfirm 7zip innoextract aria2
-	elif command -v apt-get >/dev/null; then
-		sudo apt-get install -y 7zip innoextract aria2 || sudo apt-get install -y p7zip-full innoextract aria2
-	elif command -v dnf >/dev/null; then
-		sudo dnf install -y 7zip innoextract aria2 || sudo dnf install -y p7zip p7zip-plugins innoextract aria2
-	elif command -v zypper >/dev/null; then
-		sudo zypper --non-interactive install 7zip innoextract aria2
+	missing=()
+	{ command -v 7z >/dev/null 2>&1 || command -v 7za >/dev/null 2>&1; } || missing+=(7zip)
+	command -v innoextract >/dev/null 2>&1 || missing+=(innoextract)
+	command -v aria2c >/dev/null 2>&1 || missing+=(aria2)
+	if [ "${#missing[@]}" -eq 0 ]; then
+		echo "bagimliliklar tamam (7z, innoextract, aria2)"
 	else
-		echo "uyari: paket yoneticisi taninmadi; 7z, innoextract, aria2 elle kurulmali" >&2
+		echo "eksik bagimliliklar kuruluyor: ${missing[*]}"
+		dep_ok=0
+		if command -v pacman >/dev/null; then
+			if sudo pacman -S --needed --noconfirm "${missing[@]}"; then dep_ok=1; fi
+		elif command -v apt-get >/dev/null; then
+			if { sudo apt-get update -qq; sudo apt-get install -y "${missing[@]}"; } \
+				|| sudo apt-get install -y p7zip-full innoextract aria2; then dep_ok=1; fi
+		elif command -v dnf >/dev/null; then
+			if sudo dnf install -y "${missing[@]}" \
+				|| sudo dnf install -y p7zip p7zip-plugins innoextract aria2; then dep_ok=1; fi
+		elif command -v zypper >/dev/null; then
+			if sudo zypper --non-interactive install "${missing[@]}"; then dep_ok=1; fi
+		fi
+		if [ "$dep_ok" != 1 ]; then
+			echo "UYARI: kurulamadi (${missing[*]}); kurulum devam ediyor." >&2
+			echo "  fix indirmeleri icin sonra elle kur: 7zip (p7zip), innoextract, aria2" >&2
+		fi
 	fi
 fi
 
