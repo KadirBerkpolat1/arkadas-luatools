@@ -7,7 +7,7 @@
 # ayrica manuel dogrulama icin durur.
 set -euo pipefail
 BASE="https://github.com/KadirBerkpolat1/arkadas-luatools/releases/latest/download"
-EXPECTED_SHA256="fa335547d11632820daaa1a6cdd9e4336c4bd93468a323828bc03353efabfa73"
+EXPECTED_SHA256="438de8a3f21d3eb03054709bc265968e649d48aaa298a4fef1d8da2e1c0a7966"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 echo "== arkadas-luatools indiriliyor =="
